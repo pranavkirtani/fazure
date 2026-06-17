@@ -109,9 +109,13 @@ type keyQueryPlan struct {
 }
 
 // keyQueryPlan analyzes the compiled filter for PartitionKey/RowKey constraints usable as
-// scan bounds. It only produces a single-partition plan when the expression is a pure AND
-// of comparisons (no OR / functions) — the only shape where the extracted constraints are
-// guaranteed to hold for every matching row.
+// scan bounds. Bounds are extracted from comparison leaves along the top-level AND spine —
+// every such leaf is a necessary condition for all matching rows, so it is safe to bound on
+// them even when the expression also contains non-comparison branches (e.g. an OR group, as
+// in a batch-get "PartitionKey eq X and (RowKey eq r1 or RowKey eq r2 ...)"). Such residual
+// branches mean the bounds are a superset, so coversFilter stays false and the per-row
+// filter still runs — but the scan is still bounded to the partition instead of degrading to
+// a full table scan.
 func (c *CompiledFilter) keyQueryPlan() keyQueryPlan {
 	plan := keyQueryPlan{}
 	if c == nil || c.root == nil {
@@ -120,10 +124,7 @@ func (c *CompiledFilter) keyQueryPlan() keyQueryPlan {
 		return plan
 	}
 
-	leaves, pureAnd := flattenAnd(c.root)
-	if !pureAnd {
-		return plan
-	}
+	leaves, hasResidual := collectAndLeaves(c.root)
 
 	partitionEquals := 0
 	rowExactCount := 0
@@ -174,7 +175,7 @@ func (c *CompiledFilter) keyQueryPlan() keyQueryPlan {
 		}
 	}
 
-	plan.coversFilter = keyOnly && plan.hasPartition && partitionEquals == 1 && rowExactCount <= 1
+	plan.coversFilter = keyOnly && !hasResidual && plan.hasPartition && partitionEquals == 1 && rowExactCount <= 1
 	if plan.hasRowExact && (plan.rowLow.set || plan.rowHigh.set) {
 		// A RowKey eq combined with a range can't be represented by a single point bound
 		// alone; fall back to per-row evaluation for safety.
@@ -199,19 +200,26 @@ func applyRowHigh(cur *rowKeyBound, cand rowKeyBound) {
 	}
 }
 
-// flattenAnd returns the comparison leaves of an AND-only expression tree. pureAnd is false
-// if the tree contains anything other than andNode/comparisonNode (e.g. an OR or a string
-// function), in which case the leaves must not be used to bound a scan.
-func flattenAnd(n filterNode) (leaves []*comparisonNode, pureAnd bool) {
+// collectAndLeaves walks the top-level AND spine and returns the comparison leaves usable
+// for scan bounds. hasResidual is true if any branch is something other than a comparison
+// (an OR group, a string function, etc.). Such a branch can't be expressed as key bounds, so
+// the bounds become a superset and per-row filtering must still run — but the comparison
+// leaves along the spine are still necessary conditions for every match, so they remain safe
+// to bound on (this is what keeps "PartitionKey eq X and (RowKey eq a or RowKey eq b)" a
+// partition scan rather than a full table scan).
+func collectAndLeaves(n filterNode) (leaves []*comparisonNode, hasResidual bool) {
 	switch node := n.(type) {
 	case *comparisonNode:
-		return []*comparisonNode{node}, true
+		return []*comparisonNode{node}, false
 	case *andNode:
-		l, lok := flattenAnd(node.left)
-		r, rok := flattenAnd(node.right)
-		return append(l, r...), lok && rok
-	default:
+		l, lr := collectAndLeaves(node.left)
+		r, rr := collectAndLeaves(node.right)
+		return append(l, r...), lr || rr
+	case alwaysTrueNode:
 		return nil, false
+	default:
+		// OR groups, string functions, etc. — not expressible as key bounds.
+		return nil, true
 	}
 }
 

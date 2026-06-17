@@ -70,6 +70,7 @@ func TestQueryEntitiesMatchesBruteForceFilter(t *testing.T) {
 		"PartitionKey eq 'p1' and RowKey le '0009'",                      // upper bound only
 		"PartitionKey eq 'p1' and RowKey ge '0020'",                      // lower bound only
 		"PartitionKey eq 'p1' and RowKey eq '0007'",                      // point lookup
+		"PartitionKey eq 'p2' and (RowKey eq '0003' or RowKey eq '0007' or RowKey eq '0011')", // batch-get shape (must stay partition-bounded)
 		"PartitionKey eq 'p1' and Status eq 'active'",                    // compound, NOT covered by prefix
 		"PartitionKey eq 'pv' and RowKey le 'B'",                         // loose-bound leak: excludes B1/BA
 		"PartitionKey eq 'pv' and RowKey lt 'B'",                         // exclusive: excludes B itself
@@ -149,4 +150,37 @@ func bruteForce(t *testing.T, table *Table, filter string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// TestKeyQueryPlanBounding guards scan bounding (not just result correctness). The
+// regression that motivated this: a batch-get filter "PartitionKey eq X and (RowKey eq a or
+// RowKey eq b)" must stay bounded to partition X, NOT degrade to a full table scan. It also
+// pins which shapes are fully covered (per-row filter skipped) vs only bounded.
+func TestKeyQueryPlanBounding(t *testing.T) {
+	cases := []struct {
+		filter       string
+		hasPartition bool
+		coversFilter bool
+	}{
+		{"PartitionKey eq 'X'", true, true},
+		{"PartitionKey eq 'X' and RowKey eq 'r'", true, true},
+		{"PartitionKey eq 'X' and RowKey ge 'a' and RowKey le 'b'", true, true},
+		// Batch-get: bounded to the partition, but the OR keeps it from being fully covered.
+		{"PartitionKey eq 'X' and (RowKey eq 'a' or RowKey eq 'b')", true, false},
+		// Partition + non-key predicate: bounded, not covered.
+		{"PartitionKey eq 'X' and Status eq 'active'", true, false},
+		// No single-partition constraint: cannot bound.
+		{"Status eq 'active'", false, false},
+		{"PartitionKey eq 'X' or PartitionKey eq 'Y'", false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.filter, func(t *testing.T) {
+			compiled, err := CompileFilter(tc.filter)
+			require.NoError(t, err)
+			plan := compiled.keyQueryPlan()
+			require.Equal(t, tc.hasPartition, plan.hasPartition, "hasPartition for %q", tc.filter)
+			require.Equal(t, tc.coversFilter, plan.coversFilter, "coversFilter for %q", tc.filter)
+		})
+	}
 }
