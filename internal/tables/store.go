@@ -970,6 +970,36 @@ func (t *Table) QueryEntities(
 			"filter", filter,
 			"top", top,
 		)
+	} else if plan.hasPartitionRange {
+		// PartitionKey range: bound the scan to the span of partitions [low, high) rather than
+		// scanning the whole table. RowKey constraints (if any) can't apply across partitions,
+		// so they fall to per-row filtering.
+		pkHint = "range"
+		lowerBound = tablePrefix(t.name)
+		upperBound = upperBoundForPrefix(tablePrefix(t.name))
+		if plan.partitionLow.set {
+			pp := partitionPrefix(t.name, plan.partitionLow.value)
+			if plan.partitionLow.inclusive {
+				lowerBound = pp // ge: start at the partition (and everything after it)
+			} else {
+				lowerBound = upperBoundForPrefix(pp) // gt: skip past the partition itself
+			}
+		}
+		if plan.partitionHigh.set {
+			pp := partitionPrefix(t.name, plan.partitionHigh.value)
+			if plan.partitionHigh.inclusive {
+				upperBound = upperBoundForPrefix(pp) // le: include the whole partition
+			} else {
+				upperBound = pp // lt: exclude the partition
+			}
+		}
+		t.log.Debug("query bounded to partition range",
+			"partitionLow", plan.partitionLow.value,
+			"partitionHigh", plan.partitionHigh.value,
+			"coversFilter", plan.coversFilter,
+			"filter", filter,
+			"top", top,
+		)
 	} else {
 		// No single-partition constraint: scan the whole table and rely on per-row filtering.
 		fullScan = true

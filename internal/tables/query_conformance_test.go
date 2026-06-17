@@ -76,6 +76,12 @@ func TestQueryEntitiesMatchesBruteForceFilter(t *testing.T) {
 		"PartitionKey eq 'pv' and RowKey lt 'B'",                         // exclusive: excludes B itself
 		"PartitionKey eq 'pv' and RowKey ge 'B'",                         // includes B/B1/BA/C
 		"PartitionKey eq 'pv' and RowKey gt 'B'",                         // excludes B, includes B1/BA/C
+		"PartitionKey ge 'p2'",                                          // partition range: lower only
+		"PartitionKey lt 'p3'",                                          // partition range: upper only
+		"PartitionKey ge 'p1' and PartitionKey lt 'p3'",                 // partition range: both, inclusive/exclusive
+		"PartitionKey gt 'p1' and PartitionKey le 'p3'",                 // partition range: exclusive/inclusive
+		"PartitionKey ge 'p2' and RowKey ge '0010'",                     // partition range + RowKey residual (per-row)
+		"PartitionKey ge 'p1' and PartitionKey lt 'p3' and Status eq 'active'", // partition range + non-key residual
 		"Status eq 'active'",                                             // non-key full scan
 		"Status ne 'active'",                                             // ne
 		"RowKey gt '0010'",                                               // key range, no partition
@@ -158,20 +164,27 @@ func bruteForce(t *testing.T, table *Table, filter string) []string {
 // pins which shapes are fully covered (per-row filter skipped) vs only bounded.
 func TestKeyQueryPlanBounding(t *testing.T) {
 	cases := []struct {
-		filter       string
-		hasPartition bool
-		coversFilter bool
+		filter            string
+		hasPartition      bool
+		hasPartitionRange bool
+		coversFilter      bool
 	}{
-		{"PartitionKey eq 'X'", true, true},
-		{"PartitionKey eq 'X' and RowKey eq 'r'", true, true},
-		{"PartitionKey eq 'X' and RowKey ge 'a' and RowKey le 'b'", true, true},
+		{"PartitionKey eq 'X'", true, false, true},
+		{"PartitionKey eq 'X' and RowKey eq 'r'", true, false, true},
+		{"PartitionKey eq 'X' and RowKey ge 'a' and RowKey le 'b'", true, false, true},
 		// Batch-get: bounded to the partition, but the OR keeps it from being fully covered.
-		{"PartitionKey eq 'X' and (RowKey eq 'a' or RowKey eq 'b')", true, false},
+		{"PartitionKey eq 'X' and (RowKey eq 'a' or RowKey eq 'b')", true, false, false},
 		// Partition + non-key predicate: bounded, not covered.
-		{"PartitionKey eq 'X' and Status eq 'active'", true, false},
+		{"PartitionKey eq 'X' and Status eq 'active'", true, false, false},
+		// Partition ranges: bounded to a span of partitions; pure range is fully covered.
+		{"PartitionKey ge 'X'", false, true, true},
+		{"PartitionKey ge 'X' and PartitionKey lt 'Y'", false, true, true},
+		{"PartitionKey gt 'X' and PartitionKey le 'Y'", false, true, true},
+		// Partition range + RowKey: range-bounded, RowKey is per-row residual.
+		{"PartitionKey ge 'X' and RowKey ge 'a'", false, true, false},
 		// No single-partition constraint: cannot bound.
-		{"Status eq 'active'", false, false},
-		{"PartitionKey eq 'X' or PartitionKey eq 'Y'", false, false},
+		{"Status eq 'active'", false, false, false},
+		{"PartitionKey eq 'X' or PartitionKey eq 'Y'", false, false, false},
 	}
 
 	for _, tc := range cases {
@@ -180,6 +193,7 @@ func TestKeyQueryPlanBounding(t *testing.T) {
 			require.NoError(t, err)
 			plan := compiled.keyQueryPlan()
 			require.Equal(t, tc.hasPartition, plan.hasPartition, "hasPartition for %q", tc.filter)
+			require.Equal(t, tc.hasPartitionRange, plan.hasPartitionRange, "hasPartitionRange for %q", tc.filter)
 			require.Equal(t, tc.coversFilter, plan.coversFilter, "coversFilter for %q", tc.filter)
 		})
 	}

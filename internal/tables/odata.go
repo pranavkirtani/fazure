@@ -99,13 +99,23 @@ type rowKeyBound struct {
 // ENTIRE filter, so per-row evaluation can be skipped — the bounded rows are precisely the
 // matching rows.
 type keyQueryPlan struct {
+	// Single-partition constraint (PartitionKey eq). When set, RowKey constraints below can
+	// further narrow the scan within that partition.
 	partitionEqual string
 	hasPartition   bool
 	rowExact       string
 	hasRowExact    bool
 	rowLow         rowKeyBound
 	rowHigh        rowKeyBound
-	coversFilter   bool
+
+	// Partition-range constraint (PartitionKey ge/gt/le/lt), used only when there is no
+	// single-partition eq. Bounds the scan to a span of partitions. RowKey constraints can't
+	// be applied across a partition range, so they fall to per-row filtering.
+	hasPartitionRange bool
+	partitionLow      rowKeyBound
+	partitionHigh     rowKeyBound
+
+	coversFilter bool
 }
 
 // keyQueryPlan analyzes the compiled filter for PartitionKey/RowKey constraints usable as
@@ -133,7 +143,12 @@ func (c *CompiledFilter) keyQueryPlan() keyQueryPlan {
 		switch leaf.field {
 		case "PartitionKey":
 			v, ok := leaf.right.(string)
-			if leaf.op == "eq" && ok {
+			if !ok {
+				keyOnly = false
+				continue
+			}
+			switch leaf.op {
+			case "eq":
 				if plan.hasPartition && plan.partitionEqual != v {
 					// Conflicting PartitionKey eq values: unsatisfiable. Don't bound to one
 					// partition; let per-row evaluation return nothing.
@@ -142,9 +157,21 @@ func (c *CompiledFilter) keyQueryPlan() keyQueryPlan {
 				plan.partitionEqual = v
 				plan.hasPartition = true
 				partitionEquals++
-				continue
+			case "ge":
+				applyRowLow(&plan.partitionLow, rowKeyBound{value: v, inclusive: true, set: true})
+				plan.hasPartitionRange = true
+			case "gt":
+				applyRowLow(&plan.partitionLow, rowKeyBound{value: v, inclusive: false, set: true})
+				plan.hasPartitionRange = true
+			case "le":
+				applyRowHigh(&plan.partitionHigh, rowKeyBound{value: v, inclusive: true, set: true})
+				plan.hasPartitionRange = true
+			case "lt":
+				applyRowHigh(&plan.partitionHigh, rowKeyBound{value: v, inclusive: false, set: true})
+				plan.hasPartitionRange = true
+			default:
+				keyOnly = false
 			}
-			keyOnly = false
 		case "RowKey":
 			rv, ok := leaf.right.(string)
 			if !ok {
@@ -175,11 +202,22 @@ func (c *CompiledFilter) keyQueryPlan() keyQueryPlan {
 		}
 	}
 
-	plan.coversFilter = keyOnly && !hasResidual && plan.hasPartition && partitionEquals == 1 && rowExactCount <= 1
-	if plan.hasRowExact && (plan.rowLow.set || plan.rowHigh.set) {
-		// A RowKey eq combined with a range can't be represented by a single point bound
-		// alone; fall back to per-row evaluation for safety.
-		plan.coversFilter = false
+	switch {
+	case plan.hasPartition:
+		// Single partition: the eq bound (optionally narrowed by RowKey) fully covers the
+		// filter when nothing else is present. A RowKey eq combined with a range, or any
+		// PartitionKey range alongside the eq, can't be expressed by the bounds alone.
+		plan.coversFilter = keyOnly && !hasResidual && partitionEquals == 1 &&
+			rowExactCount <= 1 && !plan.hasPartitionRange
+		if plan.hasRowExact && (plan.rowLow.set || plan.rowHigh.set) {
+			plan.coversFilter = false
+		}
+	case plan.hasPartitionRange:
+		// Partition range: covered only when the partition-range comparisons are the entire
+		// filter. RowKey constraints can't be applied across partitions, so their presence
+		// (or any non-key residual) means per-row filtering must still run.
+		plan.coversFilter = keyOnly && !hasResidual &&
+			!plan.hasRowExact && !plan.rowLow.set && !plan.rowHigh.set
 	}
 	return plan
 }
