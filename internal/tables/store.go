@@ -983,7 +983,6 @@ func (t *Table) QueryEntities(
 			scanReason = "filter not partition-restricted"
 		}
 		t.log.Debug("query using table scan",
-			"table", t.name,
 			"reason", scanReason,
 			"filter", filter,
 			"top", top,
