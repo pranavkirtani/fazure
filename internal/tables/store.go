@@ -416,6 +416,11 @@ func (ts *TableStore) GetTable(ctx context.Context, tableName string) (*Table, e
 }
 
 // keyValidation helpers
+//
+// Matches Azure Table Storage key constraints: non-empty, at most 1 KiB, and free of the
+// disallowed characters '/', '\', '#', '?' and control characters U+0000–U+001F and
+// U+007F–U+009F. Iterates runes (not bytes) so multi-byte UTF-8 characters whose
+// continuation bytes fall in the control ranges are not falsely rejected.
 func validateKey(v string) error {
 	if v == "" {
 		return ErrInvalidEntity
@@ -423,9 +428,13 @@ func validateKey(v string) error {
 	if len(v) > 1024 {
 		return ErrInvalidEntity
 	}
-	for i := 0; i < len(v); i++ {
-		c := v[i]
-		if c == '/' || c == '\\' || c == '#' || c == '?' || c == '\t' || c == '\n' || c < 0x20 {
+	for _, r := range v {
+		switch {
+		case r == '/' || r == '\\' || r == '#' || r == '?':
+			return ErrInvalidEntity
+		case r <= 0x1F: // C0 control characters (includes tab, newline, carriage return)
+			return ErrInvalidEntity
+		case r >= 0x7F && r <= 0x9F: // DEL and C1 control characters
 			return ErrInvalidEntity
 		}
 	}
@@ -906,74 +915,80 @@ func (t *Table) QueryEntities(
 		}
 	}
 
-	partitionKeyHint := extractPartitionKeyHint(filter)
-	rowKeyHint := extractRowKeyHint(filter)
-	pkHint = partitionKeyHint.Exact
+	// Derive scan bounds (and whether the bounds fully cover the filter) from the compiled
+	// filter. When it is a pure AND of PartitionKey/RowKey constraints we bound the iterator
+	// to exactly that key range using Azure Table Storage semantics for eq/ge/gt/le/lt.
+	var plan keyQueryPlan
+	if compiledFilter != nil {
+		plan = compiledFilter.keyQueryPlan()
+	}
 
 	var (
 		lowerBound []byte
 		upperBound []byte
 	)
 
-	if partitionKeyHint.Exact != "" {
-		// Exact match optimization: PartitionKey eq 'value'
-		prefix := partitionPrefix(t.name, partitionKeyHint.Exact)
+	if plan.hasPartition {
+		pkHint = plan.partitionEqual
+		prefix := partitionPrefix(t.name, plan.partitionEqual)
 		lowerBound = prefix
 		upperBound = upperBoundForPrefix(prefix)
 
-		// If we have RowKey range hints within this partition, refine the bounds
-		if rowKeyHint.Exact != "" {
-			// Exact RowKey: narrow to single entity
-			lowerBound = dataKey(t.name, partitionKeyHint.Exact, rowKeyHint.Exact)
-			upperBound = dataKey(t.name, partitionKeyHint.Exact, rowKeyHint.Exact+"\x00")
-		} else if rowKeyHint.UseRange {
-			// RowKey range: set bounds within partition
-			if rowKeyHint.RangeStart != "" {
-				lowerBound = dataKey(t.name, partitionKeyHint.Exact, rowKeyHint.RangeStart)
+		switch {
+		case plan.hasRowExact:
+			// Exact RowKey: narrow to the single entity. The upper bound appends the key
+			// separator so it includes the row itself but excludes any longer successor.
+			lowerBound = dataKey(t.name, plan.partitionEqual, plan.rowExact)
+			upperBound = append(dataKey(t.name, plan.partitionEqual, plan.rowExact), keySep)
+		default:
+			if plan.rowLow.set {
+				lk := dataKey(t.name, plan.partitionEqual, plan.rowLow.value)
+				if !plan.rowLow.inclusive {
+					// gt: exclude the bound value itself. No valid RowKey contains 0x00, so
+					// value+0x00 is the smallest key strictly greater than the value.
+					lk = append(lk, keySep)
+				}
+				lowerBound = lk
 			}
-			if rowKeyHint.RangeEnd != "" {
-				// For RowKey le/lt, we need to include up to and possibly including the end key
-				// Using upperBoundForPrefix on the end key's prefix
-				endKey := dataKey(t.name, partitionKeyHint.Exact, rowKeyHint.RangeEnd)
-				upperBound = upperBoundForPrefix(endKey)
+			if plan.rowHigh.set {
+				hk := dataKey(t.name, plan.partitionEqual, plan.rowHigh.value)
+				if plan.rowHigh.inclusive {
+					// le: include the bound value, exclude its successors (e.g. "B" but not "B1").
+					hk = append(hk, keySep)
+				}
+				// lt: the exclusive upper bound is the value's key itself.
+				upperBound = hk
 			}
 		}
 
-		t.log.Debug("query using exact partition",
-			"partitionKey", partitionKeyHint.Exact,
-			"prefix", string(prefix),
+		t.log.Debug("query bounded to partition",
+			"partitionKey", plan.partitionEqual,
+			"rowExact", plan.hasRowExact,
+			"rowLow", plan.rowLow.set,
+			"rowHigh", plan.rowHigh.set,
+			"coversFilter", plan.coversFilter,
 			"filter", filter,
 			"top", top,
-			"continuation", nextPK != "" || nextRK != "",
-			"rowKeyHint", rowKeyHint.UseRange || rowKeyHint.Exact != "",
 		)
 	} else {
-		// Full table scan for range queries or no partition filter
+		// No single-partition constraint: scan the whole table and rely on per-row filtering.
 		fullScan = true
 		prefix := tablePrefix(t.name)
 		lowerBound = prefix
 		upperBound = upperBoundForPrefix(prefix)
 
-		if filter != "" {
-			if partitionKeyHint.UseRange {
-				scanReason = "partition key range query"
-			} else {
-				scanReason = "filter not partition-restricted"
-			}
-			t.log.Debug("query using table scan",
-				"table", t.name,
-				"reason", scanReason,
-				"filter", filter,
-				"top", top,
-				"continuation", nextPK != "" || nextRK != "",
-			)
-		} else {
+		if filter == "" {
 			scanReason = "no filter provided"
-			t.log.Debug("query using full table scan (no filter)",
-				"top", top,
-				"continuation", nextPK != "" || nextRK != "",
-			)
+		} else {
+			scanReason = "filter not partition-restricted"
 		}
+		t.log.Debug("query using table scan",
+			"table", t.name,
+			"reason", scanReason,
+			"filter", filter,
+			"top", top,
+			"continuation", nextPK != "" || nextRK != "",
+		)
 	}
 
 	if nextPK != "" && nextRK != "" {
@@ -1002,14 +1017,13 @@ func (t *Table) QueryEntities(
 		limit = 1000
 	}
 
-	// Decide whether per-row filter evaluation is needed. When the filter is exactly
-	// "PartitionKey eq '<value>'" and the iterator is already bounded to that partition's
-	// key prefix, every row in range matches, so we can skip per-row evaluation entirely.
-	applyFilter := compiledFilter != nil
-	if applyFilter && partitionKeyHint.Exact != "" && compiledFilter.coveredByPartitionPrefix() {
-		applyFilter = false
-		t.log.Debug("skipping per-row filter; partition prefix bounds fully cover filter",
-			"partitionKey", partitionKeyHint.Exact)
+	// Decide whether per-row filter evaluation is needed. When the scan bounds already
+	// represent the entire filter (a pure PartitionKey/RowKey constraint set), every row in
+	// range matches, so per-row evaluation can be skipped entirely.
+	applyFilter := compiledFilter != nil && !plan.coversFilter
+	if compiledFilter != nil && plan.coversFilter {
+		t.log.Debug("skipping per-row filter; key bounds fully cover filter",
+			"partitionKey", plan.partitionEqual)
 	}
 
 	// matchEntity reads fields from the current scan entity (cur), so the compiled filter

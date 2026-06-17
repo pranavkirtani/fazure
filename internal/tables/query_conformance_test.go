@@ -50,13 +50,31 @@ func TestQueryEntitiesMatchesBruteForceFilter(t *testing.T) {
 		}
 	}
 
+	// Partition "pv" uses variable-length RowKeys where a value is a prefix of others
+	// ("B" vs "B1"/"BA"). This is the case where loose prefix bounds leak: "RowKey le 'B'"
+	// must return "B" but not "B1"/"BA". Because these filters are fully key-covered, the
+	// fast path skips per-row evaluation and relies solely on the bounds, so any divergence
+	// from brute-force MatchesFilter here is a bounds-tightness bug.
+	for _, rk := range []string{"A", "B", "B1", "BA", "C"} {
+		_, insErr := table.InsertEntity(ctx, "pv", rk, map[string]interface{}{"Name": "pv-" + rk})
+		require.NoError(t, insErr)
+	}
+
 	filters := []string{
 		"",                                       // no filter (full scan)
 		"PartitionKey eq 'p2'",                   // exercises the skip shortcut
 		"PartitionKey eq 'nope'",                 // empty partition
-		"PartitionKey eq 'p2' and RowKey ge '0005' and RowKey le '0010'", // merkle-like range
+		"PartitionKey eq 'p2' and RowKey ge '0005' and RowKey le '0010'", // merkle-like range (inclusive)
+		"PartitionKey eq 'p2' and RowKey gt '0005' and RowKey lt '0010'", // exclusive both ends
+		"PartitionKey eq 'p2' and RowKey ge '0005' and RowKey lt '0008'", // mixed inclusivity
+		"PartitionKey eq 'p1' and RowKey le '0009'",                      // upper bound only
+		"PartitionKey eq 'p1' and RowKey ge '0020'",                      // lower bound only
 		"PartitionKey eq 'p1' and RowKey eq '0007'",                      // point lookup
 		"PartitionKey eq 'p1' and Status eq 'active'",                    // compound, NOT covered by prefix
+		"PartitionKey eq 'pv' and RowKey le 'B'",                         // loose-bound leak: excludes B1/BA
+		"PartitionKey eq 'pv' and RowKey lt 'B'",                         // exclusive: excludes B itself
+		"PartitionKey eq 'pv' and RowKey ge 'B'",                         // includes B/B1/BA/C
+		"PartitionKey eq 'pv' and RowKey gt 'B'",                         // excludes B, includes B1/BA/C
 		"Status eq 'active'",                                             // non-key full scan
 		"Status ne 'active'",                                             // ne
 		"RowKey gt '0010'",                                               // key range, no partition

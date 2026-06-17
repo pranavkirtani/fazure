@@ -86,20 +86,133 @@ func (c *CompiledFilter) MatchGetter(get func(field string) (interface{}, bool))
 	return c.root.match(get)
 }
 
-// coveredByPartitionPrefix reports whether the filter is exactly a single
-// "PartitionKey eq '<value>'" comparison. When true, an iterator already bounded to that
-// partition's key prefix returns precisely the matching rows, so per-row filter
-// evaluation can be skipped. It deliberately returns false for any compound expression
-// (anything with additional predicates), so the skip is only taken when provably safe.
-func (c *CompiledFilter) coveredByPartitionPrefix() bool {
-	if c == nil {
-		return false
+// rowKeyBound is one endpoint of a RowKey range extracted from a filter.
+type rowKeyBound struct {
+	value     string
+	inclusive bool
+	set       bool
+}
+
+// keyQueryPlan describes the PartitionKey/RowKey constraints a compiled filter imposes,
+// so a scan can be bounded to exactly the matching key range (matching Azure Table Storage
+// semantics for eq/ge/gt/le/lt). When coversFilter is true, those constraints represent the
+// ENTIRE filter, so per-row evaluation can be skipped — the bounded rows are precisely the
+// matching rows.
+type keyQueryPlan struct {
+	partitionEqual string
+	hasPartition   bool
+	rowExact       string
+	hasRowExact    bool
+	rowLow         rowKeyBound
+	rowHigh        rowKeyBound
+	coversFilter   bool
+}
+
+// keyQueryPlan analyzes the compiled filter for PartitionKey/RowKey constraints usable as
+// scan bounds. It only produces a single-partition plan when the expression is a pure AND
+// of comparisons (no OR / functions) — the only shape where the extracted constraints are
+// guaranteed to hold for every matching row.
+func (c *CompiledFilter) keyQueryPlan() keyQueryPlan {
+	plan := keyQueryPlan{}
+	if c == nil || c.root == nil {
+		// Empty filter matches everything; an unbounded scan covers it.
+		plan.coversFilter = true
+		return plan
 	}
-	cmp, ok := c.root.(*comparisonNode)
-	if !ok {
-		return false
+
+	leaves, pureAnd := flattenAnd(c.root)
+	if !pureAnd {
+		return plan
 	}
-	return cmp.field == "PartitionKey" && cmp.op == "eq"
+
+	partitionEquals := 0
+	rowExactCount := 0
+	keyOnly := true
+	for _, leaf := range leaves {
+		switch leaf.field {
+		case "PartitionKey":
+			v, ok := leaf.right.(string)
+			if leaf.op == "eq" && ok {
+				if plan.hasPartition && plan.partitionEqual != v {
+					// Conflicting PartitionKey eq values: unsatisfiable. Don't bound to one
+					// partition; let per-row evaluation return nothing.
+					return keyQueryPlan{}
+				}
+				plan.partitionEqual = v
+				plan.hasPartition = true
+				partitionEquals++
+				continue
+			}
+			keyOnly = false
+		case "RowKey":
+			rv, ok := leaf.right.(string)
+			if !ok {
+				keyOnly = false
+				continue
+			}
+			switch leaf.op {
+			case "eq":
+				if plan.hasRowExact && plan.rowExact != rv {
+					rowExactCount++ // conflicting exact values; coverage disabled below
+				}
+				plan.rowExact = rv
+				plan.hasRowExact = true
+				rowExactCount++
+			case "ge":
+				applyRowLow(&plan.rowLow, rowKeyBound{value: rv, inclusive: true, set: true})
+			case "gt":
+				applyRowLow(&plan.rowLow, rowKeyBound{value: rv, inclusive: false, set: true})
+			case "le":
+				applyRowHigh(&plan.rowHigh, rowKeyBound{value: rv, inclusive: true, set: true})
+			case "lt":
+				applyRowHigh(&plan.rowHigh, rowKeyBound{value: rv, inclusive: false, set: true})
+			default:
+				keyOnly = false
+			}
+		default:
+			keyOnly = false
+		}
+	}
+
+	plan.coversFilter = keyOnly && plan.hasPartition && partitionEquals == 1 && rowExactCount <= 1
+	if plan.hasRowExact && (plan.rowLow.set || plan.rowHigh.set) {
+		// A RowKey eq combined with a range can't be represented by a single point bound
+		// alone; fall back to per-row evaluation for safety.
+		plan.coversFilter = false
+	}
+	return plan
+}
+
+// applyRowLow keeps the more restrictive (larger / exclusive) lower bound.
+func applyRowLow(cur *rowKeyBound, cand rowKeyBound) {
+	if !cur.set || cand.value > cur.value ||
+		(cand.value == cur.value && !cand.inclusive && cur.inclusive) {
+		*cur = cand
+	}
+}
+
+// applyRowHigh keeps the more restrictive (smaller / exclusive) upper bound.
+func applyRowHigh(cur *rowKeyBound, cand rowKeyBound) {
+	if !cur.set || cand.value < cur.value ||
+		(cand.value == cur.value && !cand.inclusive && cur.inclusive) {
+		*cur = cand
+	}
+}
+
+// flattenAnd returns the comparison leaves of an AND-only expression tree. pureAnd is false
+// if the tree contains anything other than andNode/comparisonNode (e.g. an OR or a string
+// function), in which case the leaves must not be used to bound a scan.
+func flattenAnd(n filterNode) (leaves []*comparisonNode, pureAnd bool) {
+	switch node := n.(type) {
+	case *comparisonNode:
+		return []*comparisonNode{node}, true
+	case *andNode:
+		l, lok := flattenAnd(node.left)
+		r, rok := flattenAnd(node.right)
+		return append(l, r...), lok && rok
+	default:
+		return nil, false
+	}
 }
 
 // alwaysTrueNode matches every entity (empty filter).
@@ -501,9 +614,6 @@ type keyRangeHint struct {
 // PartitionKeyHint represents extracted partition key filter information.
 type PartitionKeyHint = keyRangeHint
 
-// RowKeyHint represents extracted row key filter information.
-type RowKeyHint = keyRangeHint
-
 // extractPartitionKeyFromFilter extracts PartitionKey filter information from OData filter
 // This allows optimizing queries by scanning only the relevant partition or partition range
 func extractPartitionKeyFromFilter(filter string) string {
@@ -522,11 +632,6 @@ func extractPartitionKeyFromFilter(filter string) string {
 // extractPartitionKeyHint extracts detailed PartitionKey filter information.
 func extractPartitionKeyHint(filter string) PartitionKeyHint {
 	return extractKeyRangeHint(filter, "partitionkey")
-}
-
-// extractRowKeyHint extracts detailed RowKey filter information.
-func extractRowKeyHint(filter string) RowKeyHint {
-	return extractKeyRangeHint(filter, "rowkey")
 }
 
 func extractKeyRangeHint(filter, keyPrefix string) keyRangeHint {
