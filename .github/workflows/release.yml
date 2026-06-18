@@ -2,6 +2,11 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional extra image tag to publish (e.g. v0.1.0)'
+        required: false
+        default: ''
 
 permissions:
   packages: write
@@ -40,3 +45,4 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.sha }}
+            ${{ inputs.version != '' && format('ghcr.io/{0}:{1}', github.repository, inputs.version) || '' }}
